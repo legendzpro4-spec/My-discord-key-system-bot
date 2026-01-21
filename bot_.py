@@ -10,9 +10,9 @@ import os
 import uuid
 
 # ---------------- CONFIG ----------------
-BOT_TOKEN = os.environ.get("DISCORD_TOKEN")  # Must match Railway variable
+BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 DB_FILE = "keys.db"
-OWNER_IDS = [1424707396395339776]  # Replace with your Discord ID(s)
+OWNER_IDS = [1424707396395339776]
 
 # ---------------- DATABASE ----------------
 def get_db_connection():
@@ -28,6 +28,7 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS products
                      (guild_id INTEGER, product_id TEXT, panel_title TEXT, panel_desc TEXT, panel_color INTEGER, panel_emoji TEXT, panel_image TEXT, redeem_role TEXT, script_content TEXT, PRIMARY KEY (guild_id, product_id))''')
         
+        # Check if panel_image column exists, if not, add it
         try:
             c.execute("SELECT panel_image FROM products LIMIT 1")
         except sqlite3.OperationalError:
@@ -52,6 +53,7 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 def is_admin_or_owner(interaction: discord.Interaction):
     if interaction.user.id in OWNER_IDS:
         return True
+    
     with get_db_connection() as conn:
         c = conn.cursor()
         c.execute("SELECT 1 FROM managers WHERE user_id=?", (str(interaction.user.id),))
@@ -148,9 +150,8 @@ class WhitelistRequestModal(discord.ui.Modal):
             conn.commit()
         await interaction.response.send_message(f"✅ Whitelist request submitted for Roblox ID: `{roblox_id}`", ephemeral=True)
 
-# ---------------- SLASH COMMANDS ----------------
+# ---------------- COMMANDS ----------------
 @bot.tree.command(name="whitelist", description="Whitelist a user")
-@app_commands.describe(user="User to whitelist", roblox_id="Roblox ID")
 async def whitelist_user(interaction: discord.Interaction, user: discord.Member, roblox_id: str):
     if not is_admin_or_owner(interaction):
         await interaction.response.send_message("❌ No permission.", ephemeral=True)
@@ -161,26 +162,25 @@ async def whitelist_user(interaction: discord.Interaction, user: discord.Member,
         conn.commit()
     await interaction.response.send_message(f"✅ Whitelisted <@{user.id}>.", ephemeral=True)
 
-@bot.tree.command(name="unwhitelist", description="Unwhitelist a user")
-@app_commands.describe(user="User to remove from whitelist")
-async def unwhitelist_user(interaction: discord.Interaction, user: discord.Member):
-    if not is_admin_or_owner(interaction):
-        await interaction.response.send_message("❌ No permission.", ephemeral=True)
-        return
-    with get_db_connection() as conn:
-        c = conn.cursor()
-        c.execute("DELETE FROM whitelist WHERE guild_id=? AND user_id=?", (interaction.guild_id, str(user.id)))
-        conn.commit()
-    await interaction.response.send_message(f"✅ Unwhitelisted <@{user.id}>.", ephemeral=True)
-
 @bot.tree.command(name="panel", description="Show the product panel")
-@app_commands.describe(product_id="Product ID")
 async def show_panel(interaction: discord.Interaction, product_id: str):
     if not interaction.guild_id: return
     with get_db_connection() as conn:
         c = conn.cursor()
         c.execute("SELECT panel_title, panel_desc, panel_color, panel_emoji, panel_image FROM products WHERE guild_id=? AND product_id=?", (interaction.guild_id, product_id))
         row = c.fetchone()
+        
+        # Get whitelist count for this product
+        c.execute("SELECT COUNT(*) FROM whitelist WHERE guild_id=?", (interaction.guild_id,))
+        whitelist_count = c.fetchone()[0]
+    
+    if not row:
+        await interaction.response.send_message("Product not found.", ephemeral=True)
+        return
+
+    # Get stats for the embed
+    with get_db_connection() as conn:
+        c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM whitelist")
         total_whitelisted = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM keys")
@@ -188,36 +188,76 @@ async def show_panel(interaction: discord.Interaction, product_id: str):
         c.execute("SELECT COUNT(*) FROM keys WHERE used_by IS NOT NULL")
         used_keys = c.fetchone()[0]
 
-    if not row:
-        await interaction.response.send_message("Product not found.", ephemeral=True)
-        return
-
     embed = discord.Embed(title=f"{row['panel_emoji'] or '🛡️'} {row['panel_title']}", description=row['panel_desc'], color=row['panel_color'] or 0x5865f2)
+    
     embed.add_field(name="📈 Statistics", value=f"**Total Whitelisted:** `{total_whitelisted}`\n**Total Keys:** `{total_keys}`\n**Redeemed Keys:** `{used_keys}`", inline=False)
+    
     if row['panel_image']: embed.set_image(url=row['panel_image'])
-
+    
     view = ProductPanel(interaction.guild_id, product_id)
     await interaction.response.send_message(embed=embed, view=view)
 
-# ---------------- EVENTS ----------------
+@bot.tree.command(name="genkey", description="Generate a product key")
+async def gen_key(interaction: discord.Interaction, product_id: str, days: int = 0):
+    if not is_admin_or_owner(interaction): return
+    key = str(uuid.uuid4()).upper()[:12]
+    expires = (datetime.utcnow() + timedelta(days=days)).isoformat() if days > 0 else None
+    with get_db_connection() as conn:
+        c = conn.cursor()
+        c.execute("INSERT INTO keys (key, reward, created_at, expires_at) VALUES (?,?,?,?)", (key, product_id, datetime.utcnow().isoformat(), expires))
+        conn.commit()
+    await interaction.response.send_message(f"✅ Key: `{key}`", ephemeral=True)
+
+@bot.tree.command(name="addproduct", description="Add a new product")
+async def add_product(interaction: discord.Interaction, product_id: str, title: str, description: str, script: str):
+    if not is_admin_or_owner(interaction): return
+    with get_db_connection() as conn:
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO products (guild_id, product_id, panel_title, panel_desc, script_content) VALUES (?,?,?,?,?)", (interaction.guild_id, product_id, title, description, script))
+        conn.commit()
+    await interaction.response.send_message(f"✅ Product `{product_id}` added.", ephemeral=True)
+
+@bot.tree.command(name="stats", description="Show bot statistics")
+async def show_stats(interaction: discord.Interaction):
+    if not is_admin_or_owner(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True)
+        return
+    
+    with get_db_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM keys")
+        total_keys = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM keys WHERE used_by IS NOT NULL")
+        used_keys = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM products")
+        total_products = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM whitelist")
+        total_whitelisted = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM whitelist_requests")
+        pending_requests = c.fetchone()[0]
+
+    embed = discord.Embed(title="📊 Bot Statistics", color=0x5865f2)
+    embed.add_field(name="Total Products", value=str(total_products), inline=True)
+    embed.add_field(name="Total Keys", value=str(total_keys), inline=True)
+    embed.add_field(name="Used Keys", value=str(used_keys), inline=True)
+    embed.add_field(name="Whitelisted Users", value=str(total_whitelisted), inline=True)
+    embed.add_field(name="Pending Requests", value=str(pending_requests), inline=True)
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
     await bot.tree.sync()
-    print("✅ Slash commands synced!")
 
 # ---------------- WEB SERVER ----------------
 app = Flask(__name__)
-
 @app.route('/')
-def home():
-    return "Bot is running!"
+def home(): return "Bot is running!"
 
 if __name__ == "__main__":
     if not BOT_TOKEN:
-        print("❌ Error: DISCORD_TOKEN not found in environment variables.")
+        print("❌ Error: DISCORD_BOT_TOKEN not found in environment variables.")
     else:
-        # Start Flask server in a thread
         Thread(target=lambda: app.run(host='0.0.0.0', port=5000)).start()
-        # Start Discord bot
         bot.run(BOT_TOKEN)
