@@ -1,6 +1,5 @@
 import discord
 from discord.ext import commands
-from discord import app_commands
 from flask import Flask
 from threading import Thread
 import sqlite3
@@ -10,7 +9,7 @@ import os
 import uuid
 
 # ---------------- CONFIG ----------------
-BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
+BOT_TOKEN = os.environ["DISCORD_TOKEN"]  # Railway environment variable
 DB_FILE = "keys.db"
 OWNER_IDS = [1424707396395339776]
 
@@ -27,13 +26,10 @@ def init_db():
                      (key TEXT PRIMARY KEY, reward TEXT, created_at TEXT, expires_at TEXT, used_by TEXT, used_at TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS products
                      (guild_id INTEGER, product_id TEXT, panel_title TEXT, panel_desc TEXT, panel_color INTEGER, panel_emoji TEXT, panel_image TEXT, redeem_role TEXT, script_content TEXT, PRIMARY KEY (guild_id, product_id))''')
-        
-        # Check if panel_image column exists, if not, add it
         try:
             c.execute("SELECT panel_image FROM products LIMIT 1")
         except sqlite3.OperationalError:
             c.execute("ALTER TABLE products ADD COLUMN panel_image TEXT")
-
         c.execute('''CREATE TABLE IF NOT EXISTS whitelist
                      (guild_id INTEGER, user_id TEXT, hwid TEXT, PRIMARY KEY (guild_id, user_id))''')
         c.execute('''CREATE TABLE IF NOT EXISTS whitelist_requests
@@ -53,7 +49,6 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 def is_admin_or_owner(interaction: discord.Interaction):
     if interaction.user.id in OWNER_IDS:
         return True
-    
     with get_db_connection() as conn:
         c = conn.cursor()
         c.execute("SELECT 1 FROM managers WHERE user_id=?", (str(interaction.user.id),))
@@ -133,7 +128,7 @@ class RedeemModal(discord.ui.Modal):
         await interaction.response.send_message(f"✅ Key redeemed! You are now whitelisted for {self.product_id}.", ephemeral=True)
 
 class WhitelistRequestModal(discord.ui.Modal):
-    roblox_id_input = discord.ui.TextInput(label="Roblox User ID", placeholder="Enter your Roblox ID.", style=discord.TextStyle.short, required=True, max_length=20)
+    roblox_id_input = discord.ui.TextInput(label="Roblox User ID", style=discord.TextStyle.short, required=True, max_length=20)
 
     def __init__(self, guild_id: int, product_id: str, user_id: str):
         super().__init__(title="Request Whitelist")
@@ -162,25 +157,26 @@ async def whitelist_user(interaction: discord.Interaction, user: discord.Member,
         conn.commit()
     await interaction.response.send_message(f"✅ Whitelisted <@{user.id}>.", ephemeral=True)
 
+@bot.tree.command(name="unwhitelist", description="Unwhitelist a user")
+async def unwhitelist_user(interaction: discord.Interaction, user: discord.Member):
+    if not is_admin_or_owner(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True)
+        return
+    with get_db_connection() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM whitelist WHERE guild_id=? AND user_id=?", (interaction.guild_id, str(user.id)))
+        conn.commit()
+    await interaction.response.send_message(f"✅ Unwhitelisted <@{user.id}>.", ephemeral=True)
+
 @bot.tree.command(name="panel", description="Show the product panel")
 async def show_panel(interaction: discord.Interaction, product_id: str):
-    if not interaction.guild_id: return
+    if not interaction.guild_id:
+        return
     with get_db_connection() as conn:
         c = conn.cursor()
         c.execute("SELECT panel_title, panel_desc, panel_color, panel_emoji, panel_image FROM products WHERE guild_id=? AND product_id=?", (interaction.guild_id, product_id))
         row = c.fetchone()
-        
-        # Get whitelist count for this product
-        c.execute("SELECT COUNT(*) FROM whitelist WHERE guild_id=?", (interaction.guild_id,))
-        whitelist_count = c.fetchone()[0]
-    
-    if not row:
-        await interaction.response.send_message("Product not found.", ephemeral=True)
-        return
 
-    # Get stats for the embed
-    with get_db_connection() as conn:
-        c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM whitelist")
         total_whitelisted = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM keys")
@@ -188,18 +184,32 @@ async def show_panel(interaction: discord.Interaction, product_id: str):
         c.execute("SELECT COUNT(*) FROM keys WHERE used_by IS NOT NULL")
         used_keys = c.fetchone()[0]
 
-    embed = discord.Embed(title=f"{row['panel_emoji'] or '🛡️'} {row['panel_title']}", description=row['panel_desc'], color=row['panel_color'] or 0x5865f2)
-    
-    embed.add_field(name="📈 Statistics", value=f"**Total Whitelisted:** `{total_whitelisted}`\n**Total Keys:** `{total_keys}`\n**Redeemed Keys:** `{used_keys}`", inline=False)
-    
-    if row['panel_image']: embed.set_image(url=row['panel_image'])
-    
+    if not row:
+        await interaction.response.send_message("Product not found.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title=f"{row['panel_emoji'] or '🛡️'} {row['panel_title']}",
+        description=row['panel_desc'],
+        color=row['panel_color'] or 0x5865f2
+    )
+
+    embed.add_field(
+        name="📈 Statistics",
+        value=f"**Total Whitelisted:** `{total_whitelisted}`\n**Total Keys:** `{total_keys}`\n**Redeemed Keys:** `{used_keys}`",
+        inline=False
+    )
+
+    if row['panel_image']:
+        embed.set_image(url=row['panel_image'])
+
     view = ProductPanel(interaction.guild_id, product_id)
     await interaction.response.send_message(embed=embed, view=view)
 
 @bot.tree.command(name="genkey", description="Generate a product key")
 async def gen_key(interaction: discord.Interaction, product_id: str, days: int = 0):
-    if not is_admin_or_owner(interaction): return
+    if not is_admin_or_owner(interaction):
+        return
     key = str(uuid.uuid4()).upper()[:12]
     expires = (datetime.utcnow() + timedelta(days=days)).isoformat() if days > 0 else None
     with get_db_connection() as conn:
@@ -210,7 +220,8 @@ async def gen_key(interaction: discord.Interaction, product_id: str, days: int =
 
 @bot.tree.command(name="addproduct", description="Add a new product")
 async def add_product(interaction: discord.Interaction, product_id: str, title: str, description: str, script: str):
-    if not is_admin_or_owner(interaction): return
+    if not is_admin_or_owner(interaction):
+        return
     with get_db_connection() as conn:
         c = conn.cursor()
         c.execute("INSERT OR REPLACE INTO products (guild_id, product_id, panel_title, panel_desc, script_content) VALUES (?,?,?,?,?)", (interaction.guild_id, product_id, title, description, script))
@@ -222,7 +233,6 @@ async def show_stats(interaction: discord.Interaction):
     if not is_admin_or_owner(interaction):
         await interaction.response.send_message("❌ No permission.", ephemeral=True)
         return
-    
     with get_db_connection() as conn:
         c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM keys")
@@ -252,12 +262,10 @@ async def on_ready():
 
 # ---------------- WEB SERVER ----------------
 app = Flask(__name__)
-@app.route('/')
-def home(): return "Bot is running!"
+@app.route("/")
+def home():
+    return "Bot is running!"
 
 if __name__ == "__main__":
-    if not BOT_TOKEN:
-        print("❌ Error: DISCORD_BOT_TOKEN not found in environment variables.")
-    else:
-        Thread(target=lambda: app.run(host='0.0.0.0', port=5000)).start()
-        bot.run(BOT_TOKEN)
+    Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))).start()
+    bot.run(BOT_TOKEN)
