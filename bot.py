@@ -1,5 +1,8 @@
 # bot.py
-# Updated: output as .txt + clearer instructions
+# Discord Lua "deobfuscator" bot (.dump + /dump)
+# Basic string unescaping + concatenation collapsing + junk removal
+# Outputs as deobfuscated.txt
+# Deploy on Railway: set DISCORD_BOT_TOKEN variable
 
 import discord
 from discord import app_commands
@@ -17,34 +20,45 @@ import os
 
 PREFIX = "."
 MAX_CODE_LENGTH = 4000
-MAX_FILE_SIZE   = 512 * 1024
+MAX_FILE_SIZE   = 512 * 1024          # ~0.5 MB
 MAX_URL_CONTENT = 300 * 1024
 
 # ────────────────────────────────────────────────
-# Deobfuscate function (same as before)
+# Cleanup function (multi-pass unescape + concat + junk removal)
 # ────────────────────────────────────────────────
 
 def try_deobfuscate_lua(raw: str) -> str:
-    def unesc(m):
+    code = raw.strip()
+
+    # Aggressive multi-pass unescape
+    def unescape_match(m):
         s = m.group(0)
-        if s.startswith(r'\x'):
-            try: return bytes.fromhex(s[2:]).decode('latin1', errors='replace')
-            except: return s
-        if s.startswith(r'\u'):
-            try: return chr(int(s[2:], 16))
-            except: return s
-        if s[1:].isdigit():
-            try: return chr(int(s[1:]))
-            except: return s
-        return s
+        try:
+            if s.startswith(r'\x'):
+                return bytes.fromhex(s[2:]).decode('utf-8', errors='replace')
+            if s.startswith(r'\u'):
+                return chr(int(s[2:], 16))
+            if s[1:].isdigit() and len(s[1:]) <= 3:
+                return chr(int(s[1:]))
+            return s
+        except:
+            return s
 
-    code = re.sub(r'\\x[0-9a-fA-F]{2}|\\u[0-9a-fA-F]{4,6}|\\[0-7]{1,3}|\\.', unesc, raw)
+    for _ in range(10):
+        code = re.sub(r'\\x[0-9a-fA-F]{2}|\\u[0-9a-fA-F]{4,6}|\\[0-7]{1,3}|\\.', unescape_match, code)
 
-    code = re.sub(r'(["\'])(.*?)\1\s*\.\.\s*(["\'])(.*?)\3',
-                  r'\1\2\4\1', code, flags=re.DOTALL)
+    # Collapse string concatenations (repeat until no more changes)
+    prev = ""
+    while '..' in code and code != prev:
+        prev = code
+        code = re.sub(r'(["\'])(.*?)\1\s*\.\.\s*(["\'])(.*?)\3', r'\1\2\4\1', code, flags=re.DOTALL)
 
-    code = re.sub(r'(?m)^\s*local\s+[a-zA-Z_]\w*\s*=\s*["\'].*?["\']\s*;', '', code)
+    # Remove common junk patterns
+    code = re.sub(r'(?m)^\s*(local\s+)?[a-zA-Z_]\w*\s*=\s*["\'].*?["\']\s*;', '', code)
+    code = re.sub(r'(?m)^[a-zA-Z_]\w*\s*=\s*["\'].*?["\']\s*;', '', code)
+    code = re.sub(r'(?ms)if\s+(false|nil)\s+then.*?end\s*(else.*?end)?', '', code)
 
+    # Simple indentation attempt
     lines = []
     indent = 0
     for line in code.splitlines():
@@ -53,52 +67,52 @@ def try_deobfuscate_lua(raw: str) -> str:
             lines.append('')
             continue
 
-        if stripped.startswith(('else', 'elseif')) or stripped == 'end':
+        if stripped in ('end', 'else', 'elseif', 'until'):
             indent = max(0, indent - 1)
 
-        lines.append('    ' * indent + stripped)
+        lines.append('  ' * indent + stripped)
 
-        if any(stripped.startswith(w) for w in ('function', 'if', 'for', 'while', 'repeat', 'do')):
-            if not stripped.endswith('end'):
+        if any(stripped.startswith(k) for k in ('function', 'if', 'for', 'while', 'repeat', 'do')):
+            if not stripped.endswith(('end', 'do', 'then')):
                 indent += 1
-        if 'then' in stripped and not stripped.endswith('end'):
-            indent += 1
 
     cleaned = '\n'.join(lines)
-    final = textwrap.fill(cleaned, width=88,
+
+    # Final line wrapping
+    final = textwrap.fill(cleaned, width=100,
                           replace_whitespace=False,
-                          break_long_words=False,
-                          drop_whitespace=False)
+                          break_long_words=False)
 
     header = (
-        "-- Basic cleanup attempt (strings unescaped + light reformat)\n"
-        "-- NOT real deobfuscation for Luraph / MoonSec / IronBrew / VM protectors\n"
-        "-- Use specialized tools or AI for serious obfuscation\n\n"
+        "-- Basic deobfuscation attempt (WeAreDevs / light Prometheus style)\n"
+        "-- Unescaped strings, collapsed concatenations, removed some junk\n"
+        "-- Heavy VM obfuscators (MoonSec V3, IronBrew, Luraph, PSU) will still look messy\n"
+        "-- Open in VS Code / Notepad++ → Encoding → UTF-8 if you see garbled text\n\n"
     )
 
     return header + final + "\n\n-- end of cleaned output"
 
 
 # ────────────────────────────────────────────────
-# Fetch raw Lua
+# Fetch raw content from URL
 # ────────────────────────────────────────────────
 
 async def fetch_raw_lua(url: str) -> str | None:
-    headers = {"User-Agent": "LuaDeobfBot/1.0 (Discord)"}
+    headers = {"User-Agent": "LuaDeobfBot/1.0"}
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=10) as r:
-                if r.status != 200:
+            async with session.get(url, headers=headers, timeout=10) as resp:
+                if resp.status != 200:
                     return None
-                ct = r.headers.get("content-type", "").lower()
+                ct = resp.headers.get("content-type", "").lower()
                 if "text" not in ct and "lua" not in ct:
                     return None
-                data = await r.text(errors='replace')
-                if len(data) > MAX_URL_CONTENT:
+                text = await resp.text(errors='replace')
+                if len(text) > MAX_URL_CONTENT:
                     return None
-                if not any(w in data.lower() for w in ['function', 'local', 'end', 'return']):
+                if not any(kw in text.lower() for kw in ['function', 'local', 'end', 'return']):
                     return None
-                return data
+                return text
     except:
         return None
 
@@ -122,57 +136,61 @@ bot = commands.Bot(
 # Shared processing logic
 # ────────────────────────────────────────────────
 
-async def process_dump(ctx_or_inter, arg: str = None, is_slash: bool = False, file: discord.Attachment = None):
+async def process_dump(ctx_or_inter, arg: str = None, is_slash: bool = False, attachment: discord.Attachment = None):
     source = ""
 
-    attachment = file if is_slash else (ctx_or_inter.message.attachments[0] if ctx_or_inter.message.attachments else None)
-
-    if attachment:
-        if attachment.size > MAX_FILE_SIZE:
+    # File
+    att = attachment if is_slash else (ctx_or_inter.message.attachments[0] if ctx_or_inter.message.attachments else None)
+    if att:
+        if att.size > MAX_FILE_SIZE:
             msg = "File too large (max ~500 KB)."
             if is_slash: await ctx_or_inter.followup.send(msg, ephemeral=True)
             else: await ctx_or_inter.send(msg)
             return
-        if not attachment.filename.lower().endswith(('.lua', '.luau', '.txt')):
+        if not att.filename.lower().endswith(('.lua', '.luau', '.txt')):
             msg = "Please attach a .lua / .txt file."
             if is_slash: await ctx_or_inter.followup.send(msg, ephemeral=True)
             else: await ctx_or_inter.send(msg)
             return
         try:
-            bytesdata = io.BytesIO()
-            await attachment.save(bytesdata)
-            source = bytesdata.getvalue().decode("utf-8", errors="replace")
+            buf = io.BytesIO()
+            await att.save(buf)
+            source = buf.getvalue().decode("utf-8", errors="replace")
         except Exception as e:
-            msg = f"Could not read file: {e}"
+            msg = f"Failed to read file: {e}"
             if is_slash: await ctx_or_inter.followup.send(msg, ephemeral=True)
             else: await ctx_or_inter.send(msg)
             return
 
+    # URL
     elif arg and (arg.startswith("http://") or arg.startswith("https://")):
         content = await fetch_raw_lua(arg.strip())
-        if content is None:
-            msg = "Could not fetch valid raw Lua.\nUse pastebin.com/raw/... etc."
+        if content:
+            source = content
+        else:
+            msg = "Could not fetch valid Lua from that URL.\nTry pastebin raw / gist raw / rentry raw."
             if is_slash: await ctx_or_inter.followup.send(msg, ephemeral=True)
             else: await ctx_or_inter.send(msg)
             return
-        source = content
 
+    # Pasted code
     elif arg:
         if len(arg) > MAX_CODE_LENGTH:
-            msg = "Code too long → attach file or use URL."
+            msg = "Code too long → attach file or use URL instead."
             if is_slash: await ctx_or_inter.followup.send(msg, ephemeral=True)
             else: await ctx_or_inter.send(msg)
             return
         source = arg
 
+    # Nothing
     else:
         usage = (
-            f"**Usage examples:**\n"
-            f"`{PREFIX}dump` + attach file\n"
-            f"`{PREFIX}dump https://pastebin.com/raw/XXXX`\n"
-            f"`{PREFIX}dump local _=...` (small code)\n\n"
-            f"Or use `/dump` slash command\n\n"
-            f"→ Result sent as **deobfuscated.txt** (right-click → Save Link As to avoid zip issues)"
+            f"**How to use:**\n"
+            f"• `{PREFIX}dump` + attach .lua file\n"
+            f"• `{PREFIX}dump https://pastebin.com/raw/XXXX`\n"
+            f"• `{PREFIX}dump local a = ...` (small code)\n\n"
+            f"Or use the `/dump` slash command\n\n"
+            f"→ Result comes as **deobfuscated.txt**"
         )
         if is_slash: await ctx_or_inter.followup.send(usage, ephemeral=True)
         else: await ctx_or_inter.send(usage)
@@ -184,31 +202,27 @@ async def process_dump(ctx_or_inter, arg: str = None, is_slash: bool = False, fi
         else: await ctx_or_inter.send(msg)
         return
 
-    try:
-        result = try_deobfuscate_lua(source)
-    except Exception as e:
-        msg = f"Processing error:\n```{str(e)[:1400]}```"
-        if is_slash: await ctx_or_inter.followup.send(msg, ephemeral=True)
-        else: await ctx_or_inter.send(msg)
-        return
+    result = try_deobfuscate_lua(source)
 
-    file_like = io.StringIO(result)
-    discord_file = discord.File(file_like, filename="deobfuscated.txt")   # ← changed to .txt
+    file_io = io.StringIO(result)
+    discord_file = discord.File(file_io, filename="deobfuscated.txt")
 
-    content_msg = (
-        "**Basic cleanup finished**\n"
-        "Heavy VM obfuscation needs real tools / AI\n\n"
-        "**Tip:** Right-click the file below → Save Link As (don't use 'Download All' to avoid zip filename issues)"
+    reply = (
+        "**Cleanup finished**\n"
+        "This is a basic attempt — heavy VM obfuscation (MoonSec V3, IronBrew, Luraph...) "
+        "will still look messy or broken.\n\n"
+        "**Tip:** Right-click the file below → Save Link As\n"
+        "Open in VS Code / Notepad++ → Encoding → UTF-8 if text looks garbled."
     )
 
     if is_slash:
-        await ctx_or_inter.followup.send(content_msg, file=discord_file)
+        await ctx_or_inter.followup.send(reply, file=discord_file)
     else:
-        await ctx_or_inter.send(content_msg, file=discord_file, reference=ctx_or_inter.message)
+        await ctx_or_inter.send(reply, file=discord_file, reference=ctx_or_inter.message)
 
 
 # ────────────────────────────────────────────────
-# Prefix .dump
+# Prefix command: .dump
 # ────────────────────────────────────────────────
 
 @bot.command(name="dump")
@@ -217,13 +231,13 @@ async def prefix_dump(ctx: commands.Context, *, arg: str = None):
 
 
 # ────────────────────────────────────────────────
-# Slash /dump
+# Slash command: /dump
 # ────────────────────────────────────────────────
 
-@bot.tree.command(name="dump", description="Deobfuscate Lua script (code / url / file)")
+@bot.tree.command(name="dump", description="Basic Lua cleanup (file / url / pasted code)")
 @app_commands.describe(
-    code="Small Lua code directly (optional)",
-    url="Raw URL to Lua script (optional)",
+    code="Paste small code directly (optional)",
+    url="Raw link to Lua script (optional)",
     file="Upload .lua / .txt file (optional)"
 )
 async def slash_dump(
@@ -233,30 +247,28 @@ async def slash_dump(
     file: discord.Attachment = None
 ):
     await interaction.response.defer(thinking=True)
-
     arg = url if url else code
-    await process_dump(interaction, arg, is_slash=True, file=file)
+    await process_dump(interaction, arg, is_slash=True, attachment=file)
 
 
 # ────────────────────────────────────────────────
-# Ready event
+# Startup
 # ────────────────────────────────────────────────
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user}  |  Prefix: {PREFIX}")
+    print(f"Logged in as {bot.user} | Prefix: {PREFIX}")
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} slash command(s)")
     except Exception as e:
-        print("Slash sync failed:", e)
-    print("Bot is ready")
+        print(f"Slash sync failed: {e}")
+    print("Bot ready")
 
 
 if __name__ == "__main__":
     TOKEN = os.getenv("DISCORD_BOT_TOKEN")
     if not TOKEN:
-        print("ERROR: DISCORD_BOT_TOKEN environment variable is missing!")
+        print("ERROR: DISCORD_BOT_TOKEN environment variable not set")
         exit(1)
-
     bot.run(TOKEN)
