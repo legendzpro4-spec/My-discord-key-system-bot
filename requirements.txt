@@ -1,2 +1,2 @@
-discord.py
-flask
+discord.py>=2.0
+aiohttp
