@@ -1,271 +1,197 @@
+# bot.py
+# Discord bot: .dump command → basic Lua "deobfuscation" → returns file
+# Deploy-ready for Railway.app – uses environment variable for token
+
 import discord
 from discord.ext import commands
-from flask import Flask
-from threading import Thread
-import sqlite3
-from datetime import datetime, timedelta
-from io import BytesIO
+import re
+import io
+import textwrap
+import aiohttp
+import asyncio
 import os
-import uuid
 
-# ---------------- CONFIG ----------------
-BOT_TOKEN = os.environ["DISCORD_TOKEN"]  # Railway environment variable
-DB_FILE = "keys.db"
-OWNER_IDS = [1424707396395339776]
+# ────────────────────────────────────────────────
+# CONFIG
+# ────────────────────────────────────────────────
 
-# ---------------- DATABASE ----------------
-def get_db_connection():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
+PREFIX = "."                          # you can change this
+MAX_CODE_LENGTH = 4000
+MAX_FILE_SIZE   = 512 * 1024          # ~0.5 MB
+MAX_URL_CONTENT = 300 * 1024
 
-def init_db():
-    with get_db_connection() as conn:
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS keys
-                     (key TEXT PRIMARY KEY, reward TEXT, created_at TEXT, expires_at TEXT, used_by TEXT, used_at TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS products
-                     (guild_id INTEGER, product_id TEXT, panel_title TEXT, panel_desc TEXT, panel_color INTEGER, panel_emoji TEXT, panel_image TEXT, redeem_role TEXT, script_content TEXT, PRIMARY KEY (guild_id, product_id))''')
-        try:
-            c.execute("SELECT panel_image FROM products LIMIT 1")
-        except sqlite3.OperationalError:
-            c.execute("ALTER TABLE products ADD COLUMN panel_image TEXT")
-        c.execute('''CREATE TABLE IF NOT EXISTS whitelist
-                     (guild_id INTEGER, user_id TEXT, hwid TEXT, PRIMARY KEY (guild_id, user_id))''')
-        c.execute('''CREATE TABLE IF NOT EXISTS whitelist_requests
-                     (guild_id INTEGER, user_id TEXT, hwid TEXT, requested_at TEXT, PRIMARY KEY (guild_id, user_id))''')
-        c.execute('''CREATE TABLE IF NOT EXISTS managers
-                     (user_id TEXT PRIMARY KEY)''')
-        conn.commit()
+# ────────────────────────────────────────────────
+# Basic string cleanup + light beautify
+# (not real deobfuscation for VM protectors like Luraph/MoonSec)
+# ────────────────────────────────────────────────
 
-init_db()
+def try_deobfuscate_lua(raw: str) -> str:
+    def unesc(m):
+        s = m.group(0)
+        if s.startswith(r'\x'):
+            try: return bytes.fromhex(s[2:]).decode('latin1', errors='replace')
+            except: return s
+        if s.startswith(r'\u'):
+            try: return chr(int(s[2:], 16))
+            except: return s
+        if s[1:].isdigit():
+            try: return chr(int(s[1:]))
+            except: return s
+        return s
 
-# ---------------- BOT ----------------
+    code = re.sub(r'\\x[0-9a-fA-F]{2}|\\u[0-9a-fA-F]{4,6}|\\[0-7]{1,3}|\\.', unesc, raw)
+
+    code = re.sub(r'(["\'])(.*?)\1\s*\.\.\s*(["\'])(.*?)\3',
+                  r'\1\2\4\1', code, flags=re.DOTALL)
+
+    code = re.sub(r'(?m)^\s*local\s+[a-zA-Z_]\w*\s*=\s*["\'].*?["\']\s*;', '', code)
+
+    lines = []
+    indent = 0
+    for line in code.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            lines.append('')
+            continue
+
+        if stripped.startswith(('else', 'elseif')) or stripped == 'end':
+            indent = max(0, indent - 1)
+
+        lines.append('    ' * indent + stripped)
+
+        if any(stripped.startswith(w) for w in ('function', 'if', 'for', 'while', 'repeat', 'do')):
+            if not stripped.endswith('end'):
+                indent += 1
+        if 'then' in stripped and not stripped.endswith('end'):
+            indent += 1
+
+    cleaned = '\n'.join(lines)
+    final = textwrap.fill(cleaned, width=88,
+                          replace_whitespace=False,
+                          break_long_words=False,
+                          drop_whitespace=False)
+
+    header = (
+        "-- Basic cleanup attempt (strings unescaped + light reformat)\n"
+        "-- NOT real deobfuscation for Luraph / MoonSec / IronBrew / VM protectors\n"
+        "-- Use specialized tools or AI for serious obfuscation\n\n"
+    )
+
+    return header + final + "\n\n-- end of cleaned output"
+
+
+# ────────────────────────────────────────────────
+# Fetch raw Lua from URL
+# ────────────────────────────────────────────────
+
+async def fetch_raw_lua(url: str) -> str | None:
+    headers = {"User-Agent": "LuaDeobfBot/1.0 (Discord)"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=10) as r:
+                if r.status != 200:
+                    return None
+                ct = r.headers.get("content-type", "").lower()
+                if "text" not in ct and "lua" not in ct:
+                    return None
+                data = await r.text(errors='replace')
+                if len(data) > MAX_URL_CONTENT:
+                    return None
+                if not any(w in data.lower() for w in ['function', 'local', 'end', 'return']):
+                    return None
+                return data
+    except:
+        return None
+
+
+# ────────────────────────────────────────────────
+# .dump command
+# ────────────────────────────────────────────────
+
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-def is_admin_or_owner(interaction: discord.Interaction):
-    if interaction.user.id in OWNER_IDS:
-        return True
-    with get_db_connection() as conn:
-        c = conn.cursor()
-        c.execute("SELECT 1 FROM managers WHERE user_id=?", (str(interaction.user.id),))
-        if c.fetchone():
-            return True
-    return False
+bot = commands.Bot(
+    command_prefix=PREFIX,
+    intents=intents,
+    help_command=None,
+    case_insensitive=True
+)
 
-# ---------------- PANEL UI ----------------
-class ProductPanel(discord.ui.View):
-    def __init__(self, guild_id: int, product_id: str):
-        super().__init__(timeout=None)
-        self.guild_id = guild_id
-        self.product_id = product_id
 
-    @discord.ui.button(label="Redeem Key", style=discord.ButtonStyle.green, emoji="🔑", custom_id="redeem_key")
-    async def redeem_key(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(RedeemModal(self.guild_id, self.product_id))
+@bot.command(name="dump")
+async def cmd_dump(ctx: commands.Context, *, arg: str = None):
+    lua_source = ""
 
-    @discord.ui.button(label="Get Script", style=discord.ButtonStyle.blurple, emoji="📜", custom_id="get_script")
-    async def get_script(self, interaction: discord.Interaction, button: discord.ui.Button):
-        user_id = str(interaction.user.id)
-        with get_db_connection() as conn:
-            c = conn.cursor()
-            c.execute("SELECT hwid FROM whitelist WHERE guild_id=? AND user_id=?", (self.guild_id, user_id))
-            row = c.fetchone()
-            if not row:
-                await interaction.response.send_message("❌ You are not whitelisted.", ephemeral=True)
-                return
-            c.execute("SELECT script_content FROM products WHERE guild_id=? AND product_id=?", (self.guild_id, self.product_id))
-            product = c.fetchone()
-            script_text = product['script_content'] if product else None
-            if not script_text:
-                await interaction.response.send_message("No script has been set for this product.", ephemeral=True)
-                return
-            if len(script_text) > 1900:
-                file = BytesIO(script_text.encode('utf-8'))
-                await interaction.response.send_message(file=discord.File(file, filename=f"{self.product_id}_script.txt"), ephemeral=True)
-            else:
-                await interaction.response.send_message(f"```lua\n{script_text}\n```", ephemeral=True)
+    # 1. Attached file
+    if ctx.message.attachments:
+        att = ctx.message.attachments[0]
+        if att.size > MAX_FILE_SIZE:
+            return await ctx.send("File too large (max ~500 KB).")
+        if not att.filename.lower().endswith(('.lua', '.luau', '.txt')):
+            return await ctx.send("Please attach a .lua / .txt file.")
 
-    @discord.ui.button(label="Request Whitelist", style=discord.ButtonStyle.gray, emoji="🔒", custom_id="request_whitelist")
-    async def request_whitelist(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(WhitelistRequestModal(self.guild_id, self.product_id, str(interaction.user.id)))
+        try:
+            bytesdata = io.BytesIO()
+            await att.save(bytesdata)
+            lua_source = bytesdata.getvalue().decode("utf-8", errors="replace")
+        except Exception as e:
+            return await ctx.send(f"Could not read attachment: {e}")
 
-# ---------------- MODALS ----------------
-class RedeemModal(discord.ui.Modal):
-    key_input = discord.ui.TextInput(label="Enter your key", style=discord.TextStyle.short, required=True, max_length=40)
+    # 2. URL
+    elif arg and (arg.startswith("http://") or arg.startswith("https://")):
+        content = await fetch_raw_lua(arg.strip())
+        if content is None:
+            return await ctx.send("Could not fetch valid raw Lua code.\nUse pastebin raw / gist raw / rentry raw etc.")
+        lua_source = content
 
-    def __init__(self, guild_id: int, product_id: str):
-        super().__init__(title=f"Redeem Key - {product_id}")
-        self.guild_id = guild_id
-        self.product_id = product_id
+    # 3. Direct small code
+    elif arg:
+        if len(arg) > MAX_CODE_LENGTH:
+            return await ctx.send("Code too long → attach file or use URL.")
+        lua_source = arg
 
-    async def on_submit(self, interaction: discord.Interaction):
-        key = self.key_input.value.strip().upper()
-        user_id = str(interaction.user.id)
-        now = datetime.utcnow()
-        with get_db_connection() as conn:
-            c = conn.cursor()
-            c.execute("SELECT reward, expires_at, used_by FROM keys WHERE key=?", (key,))
-            row = c.fetchone()
-            if not row:
-                await interaction.response.send_message("❌ Invalid key.", ephemeral=True)
-                return
-            if row['reward'] != self.product_id:
-                await interaction.response.send_message(f"❌ This key is for another product ({row['reward']}).", ephemeral=True)
-                return
-            if row['used_by'] and row['used_by'] != user_id:
-                await interaction.response.send_message("❌ Key already used.", ephemeral=True)
-                return
-            if row['expires_at'] and datetime.fromisoformat(row['expires_at']) < now:
-                await interaction.response.send_message("❌ Key expired.", ephemeral=True)
-                return
-            c.execute("INSERT OR REPLACE INTO whitelist (guild_id,user_id,hwid) VALUES (?,?,?)", (self.guild_id, user_id, ""))
-            c.execute("UPDATE keys SET used_by=?, used_at=? WHERE key=?", (user_id, now.isoformat(), key))
-            conn.commit()
-        await interaction.response.send_message(f"✅ Key redeemed! You are now whitelisted for {self.product_id}.", ephemeral=True)
+    else:
+        return await ctx.send(
+            f"**Usage:**\n"
+            f"`{PREFIX}dump` + attach .lua file\n"
+            f"`{PREFIX}dump https://pastebin.com/raw/XXXX`\n"
+            f"`{PREFIX}dump local a = ...` (small code)\n\n"
+            f"→ Result = **deobfuscated.lua** file"
+        )
 
-class WhitelistRequestModal(discord.ui.Modal):
-    roblox_id_input = discord.ui.TextInput(label="Roblox User ID", style=discord.TextStyle.short, required=True, max_length=20)
+    if not lua_source.strip():
+        return await ctx.send("No valid Lua code found.")
 
-    def __init__(self, guild_id: int, product_id: str, user_id: str):
-        super().__init__(title="Request Whitelist")
-        self.guild_id = guild_id
-        self.product_id = product_id
-        self.user_id = user_id
+    try:
+        result = try_deobfuscate_lua(lua_source)
+    except Exception as e:
+        return await ctx.send(f"Processing error:\n```{str(e)[:1500]}```")
 
-    async def on_submit(self, interaction: discord.Interaction):
-        roblox_id = self.roblox_id_input.value.strip()
-        now = datetime.utcnow()
-        with get_db_connection() as conn:
-            c = conn.cursor()
-            c.execute("INSERT OR REPLACE INTO whitelist_requests (guild_id,user_id,hwid,requested_at) VALUES (?,?,?,?)", (self.guild_id, self.user_id, roblox_id, now.isoformat()))
-            conn.commit()
-        await interaction.response.send_message(f"✅ Whitelist request submitted for Roblox ID: `{roblox_id}`", ephemeral=True)
+    file_like = io.StringIO(result)
+    discord_file = discord.File(file_like, filename="deobfuscated.lua")
 
-# ---------------- COMMANDS ----------------
-@bot.tree.command(name="whitelist", description="Whitelist a user")
-async def whitelist_user(interaction: discord.Interaction, user: discord.Member, roblox_id: str):
-    if not is_admin_or_owner(interaction):
-        await interaction.response.send_message("❌ No permission.", ephemeral=True)
-        return
-    with get_db_connection() as conn:
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO whitelist (guild_id, user_id, hwid) VALUES (?,?,?)", (interaction.guild_id, str(user.id), roblox_id))
-        conn.commit()
-    await interaction.response.send_message(f"✅ Whitelisted <@{user.id}>.", ephemeral=True)
-
-@bot.tree.command(name="unwhitelist", description="Unwhitelist a user")
-async def unwhitelist_user(interaction: discord.Interaction, user: discord.Member):
-    if not is_admin_or_owner(interaction):
-        await interaction.response.send_message("❌ No permission.", ephemeral=True)
-        return
-    with get_db_connection() as conn:
-        c = conn.cursor()
-        c.execute("DELETE FROM whitelist WHERE guild_id=? AND user_id=?", (interaction.guild_id, str(user.id)))
-        conn.commit()
-    await interaction.response.send_message(f"✅ Unwhitelisted <@{user.id}>.", ephemeral=True)
-
-@bot.tree.command(name="panel", description="Show the product panel")
-async def show_panel(interaction: discord.Interaction, product_id: str):
-    if not interaction.guild_id:
-        return
-    with get_db_connection() as conn:
-        c = conn.cursor()
-        c.execute("SELECT panel_title, panel_desc, panel_color, panel_emoji, panel_image FROM products WHERE guild_id=? AND product_id=?", (interaction.guild_id, product_id))
-        row = c.fetchone()
-
-        c.execute("SELECT COUNT(*) FROM whitelist")
-        total_whitelisted = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM keys")
-        total_keys = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM keys WHERE used_by IS NOT NULL")
-        used_keys = c.fetchone()[0]
-
-    if not row:
-        await interaction.response.send_message("Product not found.", ephemeral=True)
-        return
-
-    embed = discord.Embed(
-        title=f"{row['panel_emoji'] or '🛡️'} {row['panel_title']}",
-        description=row['panel_desc'],
-        color=row['panel_color'] or 0x5865f2
+    await ctx.send(
+        "**Basic cleanup done**\nHeavy VM obfuscation needs real tools / AI",
+        file=discord_file,
+        reference=ctx.message
     )
 
-    embed.add_field(
-        name="📈 Statistics",
-        value=f"**Total Whitelisted:** `{total_whitelisted}`\n**Total Keys:** `{total_keys}`\n**Redeemed Keys:** `{used_keys}`",
-        inline=False
-    )
-
-    if row['panel_image']:
-        embed.set_image(url=row['panel_image'])
-
-    view = ProductPanel(interaction.guild_id, product_id)
-    await interaction.response.send_message(embed=embed, view=view)
-
-@bot.tree.command(name="genkey", description="Generate a product key")
-async def gen_key(interaction: discord.Interaction, product_id: str, days: int = 0):
-    if not is_admin_or_owner(interaction):
-        return
-    key = str(uuid.uuid4()).upper()[:12]
-    expires = (datetime.utcnow() + timedelta(days=days)).isoformat() if days > 0 else None
-    with get_db_connection() as conn:
-        c = conn.cursor()
-        c.execute("INSERT INTO keys (key, reward, created_at, expires_at) VALUES (?,?,?,?)", (key, product_id, datetime.utcnow().isoformat(), expires))
-        conn.commit()
-    await interaction.response.send_message(f"✅ Key: `{key}`", ephemeral=True)
-
-@bot.tree.command(name="addproduct", description="Add a new product")
-async def add_product(interaction: discord.Interaction, product_id: str, title: str, description: str, script: str):
-    if not is_admin_or_owner(interaction):
-        return
-    with get_db_connection() as conn:
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO products (guild_id, product_id, panel_title, panel_desc, script_content) VALUES (?,?,?,?,?)", (interaction.guild_id, product_id, title, description, script))
-        conn.commit()
-    await interaction.response.send_message(f"✅ Product `{product_id}` added.", ephemeral=True)
-
-@bot.tree.command(name="stats", description="Show bot statistics")
-async def show_stats(interaction: discord.Interaction):
-    if not is_admin_or_owner(interaction):
-        await interaction.response.send_message("❌ No permission.", ephemeral=True)
-        return
-    with get_db_connection() as conn:
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM keys")
-        total_keys = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM keys WHERE used_by IS NOT NULL")
-        used_keys = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM products")
-        total_products = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM whitelist")
-        total_whitelisted = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM whitelist_requests")
-        pending_requests = c.fetchone()[0]
-
-    embed = discord.Embed(title="📊 Bot Statistics", color=0x5865f2)
-    embed.add_field(name="Total Products", value=str(total_products), inline=True)
-    embed.add_field(name="Total Keys", value=str(total_keys), inline=True)
-    embed.add_field(name="Used Keys", value=str(used_keys), inline=True)
-    embed.add_field(name="Whitelisted Users", value=str(total_whitelisted), inline=True)
-    embed.add_field(name="Pending Requests", value=str(pending_requests), inline=True)
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user}")
-    await bot.tree.sync()
+    print(f"Logged in as {bot.user}  |  Prefix: {PREFIX}")
+    print("Bot is ready → .dump should work")
 
-# ---------------- WEB SERVER ----------------
-app = Flask(__name__)
-@app.route("/")
-def home():
-    return "Bot is running!"
+
+# ────────────────────────────────────────────────
+# Start bot – token from Railway variable
+# ────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))).start()
-    bot.run(BOT_TOKEN)
+    TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+    if not TOKEN:
+        print("ERROR: DISCORD_BOT_TOKEN environment variable is missing!")
+        exit(1)
+
+    bot.run(TOKEN)
