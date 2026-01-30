@@ -1,8 +1,10 @@
 # bot.py
-# Discord bot: .dump command → basic Lua "deobfuscation" → returns file
-# Deploy-ready for Railway.app – uses environment variable for token
+# Discord bot with .dump (prefix) and /dump (slash command)
+# Basic Lua "deobfuscation" → returns cleaned file
+# Ready for Railway.app – uses DISCORD_BOT_TOKEN env variable
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 import re
 import io
@@ -15,14 +17,13 @@ import os
 # CONFIG
 # ────────────────────────────────────────────────
 
-PREFIX = "."                          # you can change this
+PREFIX = "."
 MAX_CODE_LENGTH = 4000
 MAX_FILE_SIZE   = 512 * 1024          # ~0.5 MB
 MAX_URL_CONTENT = 300 * 1024
 
 # ────────────────────────────────────────────────
-# Basic string cleanup + light beautify
-# (not real deobfuscation for VM protectors like Luraph/MoonSec)
+# Very basic string cleanup + light beautify
 # ────────────────────────────────────────────────
 
 def try_deobfuscate_lua(raw: str) -> str:
@@ -105,7 +106,7 @@ async def fetch_raw_lua(url: str) -> str | None:
 
 
 # ────────────────────────────────────────────────
-# .dump command
+# Bot setup
 # ────────────────────────────────────────────────
 
 intents = discord.Intents.default()
@@ -119,74 +120,167 @@ bot = commands.Bot(
 )
 
 
-@bot.command(name="dump")
-async def cmd_dump(ctx: commands.Context, *, arg: str = None):
-    lua_source = ""
+# ────────────────────────────────────────────────
+# Prefix command: .dump
+# ────────────────────────────────────────────────
 
-    # 1. Attached file
-    if ctx.message.attachments:
-        att = ctx.message.attachments[0]
-        if att.size > MAX_FILE_SIZE:
-            return await ctx.send("File too large (max ~500 KB).")
-        if not att.filename.lower().endswith(('.lua', '.luau', '.txt')):
-            return await ctx.send("Please attach a .lua / .txt file.")
+@bot.command(name="dump")
+async def prefix_dump(ctx: commands.Context, *, arg: str = None):
+    await process_dump(ctx, arg, is_slash=False)
+
+
+# ────────────────────────────────────────────────
+# Slash command: /dump
+# ────────────────────────────────────────────────
+
+@bot.tree.command(name="dump", description="Deobfuscate Lua script (paste code, url or attach file)")
+@app_commands.describe(
+    code="Small Lua code directly (optional)",
+    url="Raw URL to Lua script (optional)",
+    file="Upload .lua / .txt file (optional)"
+)
+async def slash_dump(
+    interaction: discord.Interaction,
+    code: str = None,
+    url: str = None,
+    file: discord.Attachment = None
+):
+    await interaction.response.defer(thinking=True)
+
+    arg = None
+    if url:
+        arg = url
+    elif code:
+        arg = code
+
+    await process_dump(interaction, arg, is_slash=True, file=file)
+
+
+# ────────────────────────────────────────────────
+# Shared logic for both commands
+# ────────────────────────────────────────────────
+
+async def process_dump(ctx_or_inter, arg: str = None, is_slash: bool = False, file: discord.Attachment = None):
+    source = ""
+
+    # 1. File (highest priority)
+    attachment = file if is_slash else (ctx_or_inter.message.attachments[0] if ctx_or_inter.message.attachments else None)
+
+    if attachment:
+        if attachment.size > MAX_FILE_SIZE:
+            msg = "File too large (max ~500 KB)."
+            if is_slash:
+                await ctx_or_inter.followup.send(msg, ephemeral=True)
+            else:
+                await ctx_or_inter.send(msg)
+            return
+
+        if not attachment.filename.lower().endswith(('.lua', '.luau', '.txt')):
+            msg = "Please attach a .lua / .txt file."
+            if is_slash:
+                await ctx_or_inter.followup.send(msg, ephemeral=True)
+            else:
+                await ctx_or_inter.send(msg)
+            return
 
         try:
             bytesdata = io.BytesIO()
-            await att.save(bytesdata)
-            lua_source = bytesdata.getvalue().decode("utf-8", errors="replace")
+            await attachment.save(bytesdata)
+            source = bytesdata.getvalue().decode("utf-8", errors="replace")
         except Exception as e:
-            return await ctx.send(f"Could not read attachment: {e}")
+            msg = f"Could not read file: {e}"
+            if is_slash:
+                await ctx_or_inter.followup.send(msg, ephemeral=True)
+            else:
+                await ctx_or_inter.send(msg)
+            return
 
     # 2. URL
     elif arg and (arg.startswith("http://") or arg.startswith("https://")):
         content = await fetch_raw_lua(arg.strip())
         if content is None:
-            return await ctx.send("Could not fetch valid raw Lua code.\nUse pastebin raw / gist raw / rentry raw etc.")
-        lua_source = content
+            msg = "Could not fetch valid raw Lua.\nUse pastebin.com/raw/... or gist raw link."
+        else:
+            source = content
+            msg = None
 
-    # 3. Direct small code
+        if msg:
+            if is_slash:
+                await ctx_or_inter.followup.send(msg, ephemeral=True)
+            else:
+                await ctx_or_inter.send(msg)
+            return
+
+    # 3. Direct code
     elif arg:
         if len(arg) > MAX_CODE_LENGTH:
-            return await ctx.send("Code too long → attach file or use URL.")
-        lua_source = arg
+            msg = "Code too long → attach file or use URL."
+            if is_slash:
+                await ctx_or_inter.followup.send(msg, ephemeral=True)
+            else:
+                await ctx_or_inter.send(msg)
+            return
+        source = arg
 
+    # Nothing provided → show usage
     else:
-        return await ctx.send(
-            f"**Usage:**\n"
-            f"`{PREFIX}dump` + attach .lua file\n"
+        usage = (
+            f"**Usage examples:**\n"
+            f"`{PREFIX}dump` + attach file\n"
             f"`{PREFIX}dump https://pastebin.com/raw/XXXX`\n"
-            f"`{PREFIX}dump local a = ...` (small code)\n\n"
-            f"→ Result = **deobfuscated.lua** file"
+            f"`{PREFIX}dump local _=...` (small code)\n\n"
+            f"Or use `/dump` slash command"
         )
+        if is_slash:
+            await ctx_or_inter.followup.send(usage, ephemeral=True)
+        else:
+            await ctx_or_inter.send(usage)
+        return
 
-    if not lua_source.strip():
-        return await ctx.send("No valid Lua code found.")
+    if not source.strip():
+        msg = "No valid Lua code found."
+        if is_slash:
+            await ctx_or_inter.followup.send(msg, ephemeral=True)
+        else:
+            await ctx_or_inter.send(msg)
+        return
 
     try:
-        result = try_deobfuscate_lua(lua_source)
+        result = try_deobfuscate_lua(source)
     except Exception as e:
-        return await ctx.send(f"Processing error:\n```{str(e)[:1500]}```")
+        msg = f"Processing error:\n```{str(e)[:1400]}```"
+        if is_slash:
+            await ctx_or_inter.followup.send(msg, ephemeral=True)
+        else:
+            await ctx_or_inter.send(msg)
+        return
 
+    # Send as file
     file_like = io.StringIO(result)
     discord_file = discord.File(file_like, filename="deobfuscated.lua")
 
-    await ctx.send(
-        "**Basic cleanup done**\nHeavy VM obfuscation needs real tools / AI",
-        file=discord_file,
-        reference=ctx.message
-    )
+    content_msg = "**Basic cleanup finished**\nHeavy VM obfuscation needs real tools / AI"
 
+    if is_slash:
+        await ctx_or_inter.followup.send(content_msg, file=discord_file)
+    else:
+        await ctx_or_inter.send(content_msg, file=discord_file, reference=ctx_or_inter.message)
+
+
+# ────────────────────────────────────────────────
+# Startup
+# ────────────────────────────────────────────────
 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}  |  Prefix: {PREFIX}")
-    print("Bot is ready → .dump should work")
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} slash command(s)")
+    except Exception as e:
+        print("Slash sync failed:", e)
+    print("Bot is ready")
 
-
-# ────────────────────────────────────────────────
-# Start bot – token from Railway variable
-# ────────────────────────────────────────────────
 
 if __name__ == "__main__":
     TOKEN = os.getenv("DISCORD_BOT_TOKEN")
